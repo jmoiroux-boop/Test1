@@ -1,66 +1,24 @@
-import Database from 'better-sqlite3';
-import path from 'path';
-import { fileURLToPath } from 'url';
+import { createClient } from '@supabase/supabase-js';
+import dotenv from 'dotenv';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DB_PATH = path.join(__dirname, 'data', 'golf.db');
+dotenv.config();
 
-let db;
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_KEY;
 
-export function getDb() {
-  if (!db) {
-    db = new Database(DB_PATH);
-    db.pragma('journal_mode = WAL');
-    db.pragma('foreign_keys = ON');
-  }
-  return db;
+if (!supabaseUrl || !supabaseKey) {
+  console.error('Missing SUPABASE_URL or SUPABASE_KEY in .env');
+  process.exit(1);
+}
+
+const supabase = createClient(supabaseUrl, supabaseKey);
+
+export function getSupabase() {
+  return supabase;
 }
 
 export function initDatabase() {
-  const db = getDb();
-
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS courses (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      osm_id TEXT UNIQUE NOT NULL,
-      osm_type TEXT NOT NULL,
-      name TEXT,
-      lat REAL NOT NULL,
-      lng REAL NOT NULL,
-      website TEXT,
-      phone TEXT,
-      holes TEXT,
-      operator TEXT,
-      address TEXT,
-      fetched_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-
-    CREATE TABLE IF NOT EXISTS pricing (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      course_id INTEGER NOT NULL REFERENCES courses(id),
-      weekday_price REAL,
-      weekend_price REAL,
-      cart_price REAL,
-      currency TEXT DEFAULT 'EUR',
-      notes TEXT,
-      submitted_at TEXT NOT NULL DEFAULT (datetime('now')),
-      source TEXT DEFAULT 'user'
-    );
-
-    CREATE TABLE IF NOT EXISTS search_cache (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      lat REAL NOT NULL,
-      lng REAL NOT NULL,
-      radius INTEGER NOT NULL,
-      fetched_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_courses_location ON courses(lat, lng);
-    CREATE INDEX IF NOT EXISTS idx_pricing_course ON pricing(course_id);
-    CREATE INDEX IF NOT EXISTS idx_cache_location ON search_cache(lat, lng, radius);
-  `);
-
-  return db;
+  console.log('Connected to Supabase:', supabaseUrl);
 }
 
 // Haversine distance in meters
@@ -75,50 +33,57 @@ export function haversineDistance(lat1, lng1, lat2, lng2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-export function isCacheValid(lat, lng, radius) {
-  const db = getDb();
-  const row = db.prepare(`
-    SELECT id, lat, lng, radius, fetched_at FROM search_cache
-    WHERE radius >= ?
-      AND datetime(fetched_at) > datetime('now', '-24 hours')
-    ORDER BY fetched_at DESC
-  `).all(radius);
+export async function isCacheValid(lat, lng, radius) {
+  const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
 
-  for (const entry of row) {
+  const { data, error } = await supabase
+    .from('search_cache')
+    .select('*')
+    .gte('radius', radius)
+    .gte('fetched_at', oneDayAgo);
+
+  if (error || !data) return false;
+
+  for (const entry of data) {
     const dist = haversineDistance(lat, lng, entry.lat, entry.lng);
     if (dist < 5000) return true;
   }
   return false;
 }
 
-export function saveCacheEntry(lat, lng, radius) {
-  const db = getDb();
-  db.prepare('INSERT INTO search_cache (lat, lng, radius) VALUES (?, ?, ?)').run(lat, lng, radius);
+export async function saveCacheEntry(lat, lng, radius) {
+  await supabase.from('search_cache').insert({ lat, lng, radius });
 }
 
-export function upsertCourse(course) {
-  const db = getDb();
-  db.prepare(`
-    INSERT INTO courses (osm_id, osm_type, name, lat, lng, website, phone, holes, operator, address)
-    VALUES (@osm_id, @osm_type, @name, @lat, @lng, @website, @phone, @holes, @operator, @address)
-    ON CONFLICT(osm_id) DO UPDATE SET
-      name = excluded.name,
-      lat = excluded.lat,
-      lng = excluded.lng,
-      website = excluded.website,
-      phone = excluded.phone,
-      holes = excluded.holes,
-      operator = excluded.operator,
-      address = excluded.address,
-      fetched_at = datetime('now')
-  `).run(course);
+export async function upsertCourse(course) {
+  const { error } = await supabase
+    .from('courses')
+    .upsert(
+      {
+        osm_id: course.osm_id,
+        osm_type: course.osm_type,
+        name: course.name,
+        lat: course.lat,
+        lng: course.lng,
+        website: course.website,
+        phone: course.phone,
+        holes: course.holes,
+        operator: course.operator,
+        address: course.address,
+        fetched_at: new Date().toISOString(),
+      },
+      { onConflict: 'osm_id' }
+    );
+
+  if (error) console.error('Upsert course error:', error.message);
 }
 
-export function getCoursesInRadius(lat, lng, radius) {
-  const db = getDb();
-  const courses = db.prepare('SELECT * FROM courses').all();
+export async function getCoursesInRadius(lat, lng, radius) {
+  const { data, error } = await supabase.from('courses').select('*');
 
-  return courses
+  if (error || !data) return [];
+
+  return data
     .map((c) => ({
       ...c,
       distance: haversineDistance(lat, lng, c.lat, c.lng),
@@ -127,28 +92,34 @@ export function getCoursesInRadius(lat, lng, radius) {
     .sort((a, b) => a.distance - b.distance);
 }
 
-export function getLatestPricing(courseId) {
-  const db = getDb();
-  return db.prepare(`
-    SELECT * FROM pricing
-    WHERE course_id = ?
-    ORDER BY submitted_at DESC
-    LIMIT 1
-  `).get(courseId);
+export async function getLatestPricing(courseId) {
+  const { data, error } = await supabase
+    .from('pricing')
+    .select('*')
+    .eq('course_id', courseId)
+    .order('submitted_at', { ascending: false })
+    .limit(1)
+    .single();
+
+  if (error) return null;
+  return data;
 }
 
-export function addPricing(courseId, pricing) {
-  const db = getDb();
-  return db.prepare(`
-    INSERT INTO pricing (course_id, weekday_price, weekend_price, cart_price, currency, notes, source)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    courseId,
-    pricing.weekday_price ?? null,
-    pricing.weekend_price ?? null,
-    pricing.cart_price ?? null,
-    pricing.currency || 'EUR',
-    pricing.notes || null,
-    pricing.source || 'user'
-  );
+export async function addPricing(courseId, pricing) {
+  const { data, error } = await supabase
+    .from('pricing')
+    .insert({
+      course_id: courseId,
+      weekday_price: pricing.weekday_price ?? null,
+      weekend_price: pricing.weekend_price ?? null,
+      cart_price: pricing.cart_price ?? null,
+      currency: pricing.currency || 'EUR',
+      notes: pricing.notes || null,
+      source: pricing.source || 'user',
+    })
+    .select()
+    .single();
+
+  if (error) console.error('Add pricing error:', error.message);
+  return data;
 }

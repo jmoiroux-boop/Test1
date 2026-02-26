@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { fetchGolfCourses } from '../services/overpass.js';
 import {
-  getDb,
+  getSupabase,
   isCacheValid,
   saveCacheEntry,
   upsertCourse,
@@ -25,7 +25,7 @@ router.get('/', async (req, res) => {
   }
 
   try {
-    const cached = isCacheValid(lat, lng, radius);
+    const cached = await isCacheValid(lat, lng, radius);
 
     if (!cached) {
       console.log(`Fetching golf courses from Overpass: lat=${lat}, lng=${lng}, radius=${radius}`);
@@ -33,32 +33,30 @@ router.get('/', async (req, res) => {
       console.log(`Found ${courses.length} courses from Overpass`);
 
       for (const course of courses) {
-        upsertCourse(course);
+        await upsertCourse(course);
       }
 
-      saveCacheEntry(lat, lng, radius);
+      await saveCacheEntry(lat, lng, radius);
     }
 
-    const courses = getCoursesInRadius(lat, lng, radius);
+    const courses = await getCoursesInRadius(lat, lng, radius);
 
-    const enriched = courses.map((course) => {
-      const pricing = getLatestPricing(course.id);
-      return {
-        ...course,
-        pricing: pricing || null,
-      };
-    });
+    const enriched = [];
+    for (const course of courses) {
+      const pricing = await getLatestPricing(course.id);
+      enriched.push({ ...course, pricing: pricing || null });
+    }
 
     res.json({ courses: enriched, count: enriched.length, cached });
   } catch (err) {
     console.error('Error fetching courses:', err.message);
-    // Try to return cached data even on error
-    const courses = getCoursesInRadius(lat, lng, radius);
+    const courses = await getCoursesInRadius(lat, lng, radius);
     if (courses.length > 0) {
-      const enriched = courses.map((course) => {
-        const pricing = getLatestPricing(course.id);
-        return { ...course, pricing: pricing || null };
-      });
+      const enriched = [];
+      for (const course of courses) {
+        const pricing = await getLatestPricing(course.id);
+        enriched.push({ ...course, pricing: pricing || null });
+      }
       res.json({ courses: enriched, count: enriched.length, cached: true, stale: true });
     } else {
       res.status(502).json({ error: 'Unable to fetch golf courses. Please try again.' });
@@ -66,15 +64,20 @@ router.get('/', async (req, res) => {
   }
 });
 
-router.get('/:id', (req, res) => {
+router.get('/:id', async (req, res) => {
   const id = parseInt(req.params.id);
   if (isNaN(id)) return res.status(400).json({ error: 'Invalid course ID' });
 
-  const db = getDb();
-  const course = db.prepare('SELECT * FROM courses WHERE id = ?').get(id);
-  if (!course) return res.status(404).json({ error: 'Course not found' });
+  const supabase = getSupabase();
+  const { data: course, error } = await supabase
+    .from('courses')
+    .select('*')
+    .eq('id', id)
+    .single();
 
-  const pricing = getLatestPricing(id);
+  if (error || !course) return res.status(404).json({ error: 'Course not found' });
+
+  const pricing = await getLatestPricing(id);
   res.json({ ...course, pricing: pricing || null });
 });
 
